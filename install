@@ -1,0 +1,153 @@
+install(){ # Need functions "get" and (optionally) "check".
+	set -eu
+	local recycler_install_name="$*"
+	local recycler_install_ootfile="$(mktemp ",install.XXXXXXXX" 2>/dev/null || mktemp "${TMPDIR:-/tmp}/,install.XXXXXXXX")"
+	   { install_check && install_extant ; } \
+	|| { install_proceeding && ( get &>"$recycler_install_ootfile" ; ) && install_check_infdef && install_succeeded ; } \
+	|| install_failed
+}
+install_check()       {	check &>/dev/null ; }
+install_check_infdef(){ ! type check &>/dev/null || install_check ; }
+install_extant()      { printf ":-) %s\n" "$recycler_install_name already present" ; }
+install_proceeding()  { printf ":-O %s\n" "Installing $recycler_install_name..." ; }
+install_succeeded()   { printf ":-) %s\n" "Installed $recycler_install_name" ; rm -f "$recycler_install_ootfile" ; }
+install_failed()      { printf ":-( %s\n" "Failed to install ${recycler_install_name:-}.  Log in '${recycler_install_ootfile:-/dev/null}'" ; cat "${recycler_install_ootfile:-}" ; declare -f check || true ; declare -f get || true ; printf "X-( %s\n" "Bailing out at ${recycler_install_name:-}" ; exit 1 ; }
+
+# Common:
+apt_check(){
+	dpkg -l | gawk -vp="$*" -vP=$# 'BEGIN{p="^("gensub(/ +/,"|","g",p)")(:|$)"}($2~p){c++}END{exit P-c}'
+}
+install_as_root(){
+	(
+		check(){ [[ "$(id -un)" == root ]] ; }
+		get(){ echo "ERROR: this must be run as root.  Bailing out..." ; return 1 ; }
+		install as root
+	) || exit 1
+}
+install_apt_update(){
+	(
+		check(){ test -f /var/cache/apt/pkgcache.bin && test $(stat -c %Y /var/cache/apt/pkgcache.bin) -gt $(($(date -u +%s)-24*3600)) ; }
+		get(){ apt-get update ; }
+		install apt update
+	)
+}
+install_apt(){
+	(
+		packages="$*"
+		which gawk >/dev/null || apt-get install -yy gawk
+		get(){ apt-get install -yy $packages ; }
+		check(){ apt_check $packages ; }
+		install debian packages: $packages
+	) || exit 1
+}
+install_node(){
+	(	check(){ which node >/dev/null ; }
+		get(){ curl "https://gist.githubusercontent.com/bitdivine/309a1594e891dec70461/raw/4a96a04dfa179eee531647347c485a8750b9ea66/install_nodejs.sh" | tee ,node-install.sh | sh > ,node-install.log ; }
+		install nodejs
+	) || exit 1
+}
+install_node_version(){
+    local version="$1"
+    (	check(){ n use "$version" --version ; }
+		get(){
+			which n || { npm install -g n ; ln -s "$(npm root -g)/n/bin/n" /usr/local/bin/n ; }
+			n "$version"
+		}
+		install nodejs version $version
+	) || exit 1
+}
+check_size(){
+	local size="$1"
+	local path="$2"
+	local desired="$(echo $size | sed 's/[0-9]*/& /g;s/[tT]/1099511627776/g;s/[gG]/1073741824/g;s/[mM]/1048576/g;s/[kK]/1024/g;s/[bB]/1/g' | gawk '{print $1 * $2;}')"
+	local actual="$(stat -f --format="%a %S" "$path" | gawk '{print $1 * $2}')"
+	echo "actual,desired bytes: $actual $desired"
+	(( actual >= desired ))
+}
+install_size(){
+(	size="$1"
+	path="$2"
+	check(){ check_size "$size" "$path" ; }
+	get(){
+		printf "WARNING: %s\n" \
+		"$path TOO SMALL!" \
+		"It needs to be at least $size." \
+		"$(check_size "$size" "$path")" \
+		"Please resize it."
+	}
+	install "check that $path >= $size"
+)
+}
+install_lvm(){
+	(
+		set -eu
+		local dirok=true # It's OK as long as there is a dir there.
+		if [[ "$1" == "-p" ]] ; then local dirok=false ; shift ; fi
+		local name="$1"
+		local size="$2"
+		local path="$3"
+		local perm="${4:-noatime,nodev,nosuid,noexec}"
+		local pv="${pv:-lvm-local}"
+	
+		check(){ test -d "$path" && { $dirok || lvdisplay | grep -qE "^ *LV Name *$name *$" ; } && { check_size "$size" "$path" || echo "WARNING: Partition might not be big enough: Need $size at $path" ; } ; }
+		get(){
+			set -eux
+			: "=============================================="
+			: "====== Making name=$name size=$size path=$path"
+			: "====== with   pv=$pv perm=$perm"
+			if which lvdisplay &>/dev/null
+			then
+				# Check that the physical volume $pv is actually there:
+				bash -c "pvdisplay | gawk -vpv='$pv' '(/\<VG Name\>/ && \$(NF)==pv){print \$0}' | grep -q ." || { : ERROR: No such volume in pvdisplay: $pv ; : You may set an alternative volume with: pv=myvolname ...whatever ; : Volumes are: ; bash -c "pvdisplay | grep 'VG Name'" ; exit 2 ; }
+				# Rock on:
+				lvcreate -L "${size:-YOUFORGOTTOSET_size}" -n "${name:-YOUFORGOTTOSET_name}" "${pv:-YOUFORGOTTOSET_pv}" || return 1
+				mkfs.ext4 -L "${name:-YOUFORGOTTOSET_name}" "/dev/${pv:-YOUFORGOTTOSET_pv}/${name:-YOUFORGOTTOSET_name}" || return 1
+				mkdir -p "${path:-YOUFORGOTTOSET_path}" || exit 1
+				printf "LABEL=%-10s %-30s auto %-20s 0 2\n" "${name:-YOUFORGOTTOSET_name}" "${path:-YOUFORGOTTOSET_path}" "${perm:-YOUFORGOTTOSET_perm}"  >> /etc/fstab || exit 1
+				mount "${path:-YOUFORGOTTOSET_path}" || exit 1
+			else	echo "No logical volume manager.  Making dir $path"
+				mkdir -p "${path:-YOUFORGOTTOSET_path}"
+			fi
+		}
+		install "partition $name -- $size -- $path"
+	) || exit 1
+}
+function install_postgres_apt_source(){
+(       # Note: Don't use the debian sources.  Just don't.
+	# See: https://wiki.postgresql.org/wiki/Apt
+	check(){ test -e /etc/apt/sources.list.d/pgdg.list ; }
+	get(){
+		set -eu
+		apt-get install -yy curl ca-certificates lsb-release || return 1
+		debian_version="$(lsb_release -cs)"
+		test -n "${debian_version:-}" || return 1
+		echo "deb http://apt.postgresql.org/pub/repos/apt/ ${debian_version}-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list
+		# wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+		curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+		apt-get update
+	}
+	install postgres-apt-source
+) || exit 1
+}
+function install_git_node_modules(){
+(
+	get(){
+		set -eux
+		for dir in $(cat .gitmodules | sed -nr 's/^\\s*path\\s*=\\s*(\\S*node_modules\\S*)/\\1/g;ta;b;:a;p') ; do printf \"=== Installing %s\\n\" \"$dir\" ; ( cd \"$dir\" ; npm install ; ) ; printf \"=== Installation exit code: %s for %s\\n\" $? \"$dir\" ; done
+	}
+	install git-node-modules
+)
+}
+function install_check_runit(){
+(
+	service="$1"
+	check(){ update-service --list "$service" ; }
+	get(){
+		printf "WARNING: %s\n" \
+			"" \
+			"Service is not installed: $service" \
+			""
+	}
+	install check runit service "$service"
+)
+}
