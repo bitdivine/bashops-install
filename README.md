@@ -2,7 +2,7 @@
 Simple bash installers for devops
 
  * Write FAST installers
- * Make the installers _idenpotent_, which means that you can re-run them over and over again
+ * Make the installers _idempotent_, which means that you can re-run them over and over again
  
 
 
